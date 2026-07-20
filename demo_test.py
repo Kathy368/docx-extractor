@@ -2,6 +2,11 @@
 
 def hello():
     print("Hello, Git!")
+    print("这是新增的一行代码")
+
+def goodbye():
+    print("Goodbye!")
 
 if __name__ == "__main__":
     hello()
+    goodbye()
