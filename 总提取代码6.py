@@ -37,7 +37,7 @@ except Exception:
 
 # ====== 1. 路径配置 ======
 # 报告根目录路径
-ROOT_FOLDER = r"G:\中心实验室\中心实验室-新(2023.07.31)\002 报告\报告组\常规组报告 2017.11月份开始\待审核报告 新\非汽车事业部"
+ROOT_FOLDER = r"G:\中心实验室\中心实验室-新(2023.07.31)\002 报告\报告组\常规组报告 2017.11月份开始\待审核报告 新\汽车部"
 
 # 输出文件夹
 OUTPUT_FOLDER = r"D:\Kathy\PDF提取工具"
@@ -45,7 +45,7 @@ OUTPUT_FOLDER = r"D:\Kathy\PDF提取工具"
 
 # ====== 2. 【测试开关 - 非常重要】 ======
 # 测试模式1：只扫描前N个一级公司文件夹（0=全部扫描）
-TEST_FOLDER_LIMIT = 0
+TEST_FOLDER_LIMIT = 5
 
 # 测试模式2：只提取前N份报告（0=全部提取）
 TEST_REPORT_LIMIT = 0
@@ -157,6 +157,21 @@ def is_report_by_filename(filename):
             return True
 
     return False
+
+
+def extract_conclusion_from_filename(filename):
+    """
+    从文件名中提取检测结论关键词。
+    若文件名包含 "符合" / "不符合" / "合格" / "不合格"，直接返回对应关键词。
+    优先匹配更长的否定词，避免 "符合" 误命中 "不符合"。
+    """
+    name_no_ext = os.path.splitext(filename)[0]
+    # 按长度降序排列：优先 "不合格" > "不符合" > "合格" > "符合"
+    conclusion_keywords = ["不合格", "不符合", "合格", "符合"]
+    for kw in conclusion_keywords:
+        if kw in name_no_ext:
+            return kw
+    return ""
 
 
 # 扫描时跳过的文件夹黑名单
@@ -512,18 +527,22 @@ def extract_chinese_report(doc, filename):
         if std_key:
             result[std_key] = raw_val
 
-    # 2. 检测要求/结论
-    test_req, test_con = extract_test_req_conclusion_zh(doc)
-    if test_req:
-        result["检测要求"] = test_req
-    if test_con:
-        result["检测结论"] = test_con
+    # 2. 检测要求/结论（文件名含结论词时优先采用）
+    filename_conclusion = extract_conclusion_from_filename(filename)
+    if filename_conclusion:
+        result["检测结论"] = filename_conclusion
+    else:
+        test_req, test_con = extract_test_req_conclusion_zh(doc)
+        if test_req:
+            result["检测要求"] = test_req
+        if test_con:
+            result["检测结论"] = test_con
 
-    # 2.1 兜底：仍未取到检测结论时，从结果表的“结论”列提取
-    if not result.get("检测结论", "").strip():
-        fallback_con = extract_conclusion_from_result_column_zh(doc)
-        if fallback_con:
-            result["检测结论"] = fallback_con
+        # 2.1 兜底：仍未取到检测结论时，从结果表的“结论”列提取
+        if not result.get("检测结论", "").strip():
+            fallback_con = extract_conclusion_from_result_column_zh(doc)
+            if fallback_con:
+                result["检测结论"] = fallback_con
 
     # 3. 报告编号从文件名补
     m = REPORT_NO_PATTERN.search(filename)
@@ -660,13 +679,18 @@ def extract_english_report(doc, filename, file_path=None):
                 result[f"检测方法{i}"] = method["检测方法"]
                 result[f"检测仪器{i}"] = method["检测仪器"]
 
-    # 3. 检测结论：模块未提取到时，从 Test Result(s) Conclusion 兜底；仍无则最终写 Pass
-    if not result.get("检测结论", "").strip():
-        conclusion = extract_conclusion_from_test_results_en(doc)
-        if conclusion:
-            result["检测结论"] = conclusion
-    if not result.get("检测结论", "").strip():
-        result["检测结论"] = "Pass"
+    # 3. 检测结论：文件名含结论词时优先采用
+    filename_conclusion = extract_conclusion_from_filename(filename)
+    if filename_conclusion:
+        result["检测结论"] = filename_conclusion
+    else:
+        # 模块未提取到时，从 Test Result(s) Conclusion 兜底；仍无则最终写 Pass
+        if not result.get("检测结论", "").strip():
+            conclusion = extract_conclusion_from_test_results_en(doc)
+            if conclusion:
+                result["检测结论"] = conclusion
+        if not result.get("检测结论", "").strip():
+            result["检测结论"] = "Pass"
 
     return result
 
