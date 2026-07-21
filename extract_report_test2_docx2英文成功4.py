@@ -55,6 +55,7 @@ EN_FIELD_MAPPING = {
     "Sample name": "样品名称",
     "Sample Name": "样品名称",
     "Sample Description": "样品名称",
+    "Part Name": "样品名称",
     "Model": "零件号",
     "Part No.": "零件号",
     "Part Number": "零件号",
@@ -67,12 +68,21 @@ EN_FIELD_MAPPING = {
     "Manufacturer": "制造商",
     "Manufacturer & Factory": "制造商",
     "Factory": "制造商",
+    "OEM": "制造商",
     "Trade mark": "商标",
     "Trade Mark": "商标",
+
+    # 汽车部新增关键字段
+    "Vehicle type": "车型",
+    "Vehicle model": "车型",
+    "Automobile company": "主机厂",
+    "Buyer": "主机厂",
+    "Supplier": "供应商代码",
 
     # 样品编号相关
     "Sample No.": "样品编号",
     "Sample Number": "样品编号",
+    "Sample number": "样品编号",
     "Sample ID": "样品编号",
 
     # 日期相关
@@ -231,6 +241,24 @@ def normalize_key(key):
     return key
 
 
+def normalize_key_bilingual(key):
+    """
+    针对报告中“中文(English)”双语字段名做归一化。
+    去掉英文括号及括号内容、尾部中英文冒号/空格，再交给 normalize_key。
+    例如：
+      'Applicant:' -> 'Applicant'
+      '申请商(Applicant):' -> '申请商'
+      'Sample Received Date:' -> 'Sample Received Date'
+    """
+    if not key:
+        return ""
+    key = normalize_text(key)
+    # 去掉英文括号及其中的内容
+    key = re.sub(r'\s*\([A-Za-z0-9\s&/\.\-_,#()]+\)\s*', '', key)
+    key = key.rstrip('：:').strip()
+    return key
+
+
 # ==============================================
 # 函数1：提取基本信息
 # ==============================================
@@ -279,13 +307,13 @@ def extract_basic_info(doc):
 
                 # 处理只有 1 个单元格的行
                 if len(cells) == 1:
-                    key = normalize_key(cells[0])
+                    key = normalize_key_bilingual(cells[0])
                     if key and len(key) < 60:
                         fields[key] = ""
                     continue
 
                 if len(cells) == 2:
-                    key = normalize_key(cells[0])
+                    key = normalize_key_bilingual(cells[0])
                     val = cells[1].strip()
                     key = re.sub(r'\s+', ' ', key).strip()
 
@@ -320,7 +348,7 @@ def extract_basic_info(doc):
                 cells = [normalize_text(c) for c in get_row_cells_text_fast(row)]
                 if len(cells) == 4:
                     for i in range(0, 4, 2):
-                        key = normalize_key(cells[i])
+                        key = normalize_key_bilingual(cells[i])
                         val = cells[i+1].strip()
                         if key and len(key) < 40:
                             if val:
@@ -394,6 +422,7 @@ def extract_sample_count(doc):
     max_serial = 0
     desc_count = 0
     found_result_part_info = False
+    has_result_table_no_parts = False
 
     result_section_markers = ['Test Result(s)', 'Test Result', 'Test Results', 'Result(s),mg/kg', '结果,mg/kg']
     result_markers = ['Result', 'Limit', 'Conclusion', 'mg/kg']
@@ -441,6 +470,17 @@ def extract_sample_count(doc):
                            any(k in first_row_text for k in result_markers) or
                            any(kw in first_row_lower for kw in test_item_keywords))
         if is_result_table:
+            # 排除 SVHC/REACH 化学物质清单表：表头含 CAS No. 且含 EC No. 或物质名称
+            # 这类表的“序号”是化学物质编号，不是样品部件序号
+            is_chemical_list = (
+                'CAS' in first_row_text.upper() and
+                ('EC' in first_row_text.upper() or
+                 'Substance' in first_row_text or
+                 '物质名称' in first_row_text)
+            )
+            if is_chemical_list:
+                continue
+
             serial_col = find_column_index(first_row, serial_keywords)
             desc_col = find_column_index(first_row, desc_keywords)
 
@@ -472,6 +512,10 @@ def extract_sample_count(doc):
                             descs.add(d)
                     if len(descs) > desc_count:
                         desc_count = len(descs)
+            else:
+                # 有结果表但没有序号/描述列，通常是单一样品的结果表
+                # 对于含 CAS 的短汇总表（如 SVHC 汇总结果），同样视为单一样品
+                has_result_table_no_parts = True
 
         # ===== B. 无表头部件表 或 No./序号 头部件表 =====
         is_part_table = False
@@ -516,10 +560,26 @@ def extract_sample_count(doc):
                     found_result_part_info = True
 
     if found_result_part_info:
-        return max_serial if max_serial > 0 else desc_count
+        count = max_serial if max_serial > 0 else desc_count
+        if count > 2000:
+            return "样品部件总数异常请人工检查"
+        # 有结果表但序号/描述列均无有效值，视为单一样品的汇总结果
+        if count == 0:
+            return 1
+        return count
 
     # 退到独立的 Sample Description 模块
-    return extract_sample_count_from_sample_description_section(doc)
+    count = extract_sample_count_from_sample_description_section(doc)
+    if count > 0:
+        if count > 2000:
+            return "样品部件总数异常请人工检查"
+        return count
+
+    # 存在结果表但无部件拆分，视为 1 个样品
+    if has_result_table_no_parts:
+        return 1
+
+    return "未检测到"
 
 
 def extract_sample_count_from_sample_description_section(doc):
