@@ -96,7 +96,7 @@ def normalize_path(file_path):
     prefix = r"\\\\?\\"
     if sys.platform == 'win32' and not file_path.startswith(prefix):
         abs_path = os.path.abspath(file_path)
-        if len(abs_path) > 230:  # 留余量
+        if len(abs_path) >= 260:  # 超过 Windows 传统 MAX_PATH 再加前缀
             return prefix + abs_path
     return file_path
 
@@ -134,28 +134,44 @@ def fix_docx_if_needed(file_path):
 
     try:
         with zipfile.ZipFile(file_path, 'r') as zin:
+            # 第一轮：找出所有损坏的媒体文件
+            skipped_media = set()
+            for item in zin.infolist():
+                if not item.filename.startswith('word/media/'):
+                    continue
+                try:
+                    zin.read(item.filename)
+                except zipfile.BadZipFile:
+                    skipped_media.add(item.filename)
+                    if VERBOSE:
+                        print(f"    跳过损坏的图片: {item.filename}")
+
             with zipfile.ZipFile(fixed_path, 'w') as zout:
                 for item in zin.infolist():
-                    # 修复 NULL 关系
+                    # 跳过已损坏的媒体文件
+                    if item.filename in skipped_media:
+                        continue
+
+                    # 修复 NULL 关系，并删除指向损坏媒体的关系
                     if item.filename == 'word/_rels/document.xml.rels':
                         try:
                             content = zin.read(item.filename).decode('utf-8')
                             content = re.sub(r'<Relationship[^>]*Target="[^"]*NULL[^"]*"[^>]*/>', '', content)
+                            for media in skipped_media:
+                                # document.xml.rels 中 Target 为相对 word/ 目录，如 media/image5.png
+                                target = media.replace('word/', '')
+                                content = re.sub(r'<Relationship[^>]*Target="[^"]*' + re.escape(target) + r'"[^>]*/>', '', content)
                             zout.writestr(item, content)
                         except zipfile.BadZipFile:
                             # 如果连关系文件都损坏，跳过（极少见）
                             continue
                         continue
 
-                    # 尝试复制其他文件；遇到 Bad CRC 时，若是媒体文件则跳过
+                    # 尝试复制其他文件
                     try:
                         data = zin.read(item.filename)
                         zout.writestr(item, data)
                     except zipfile.BadZipFile:
-                        if item.filename.startswith('word/media/'):
-                            if VERBOSE:
-                                print(f"    跳过损坏的图片: {item.filename}")
-                            continue
                         raise
 
         if _try_open(fixed_path):
@@ -237,22 +253,36 @@ def normalize_key(key):
 
 def normalize_key_bilingual(key):
     """
-    针对汽车部报告中“中文(English)”双语字段名做归一化。
-    去掉英文括号及括号内容、尾部中英文冒号/空格，再交给 normalize_key。
-    例如：
-      '申请商(Applicant) :' -> '申请商'
-      '车型/项目号(Model/Project No.):' -> '车型/项目号'
-      'Part Name:' -> 'Part Name'
+    针对汽车部报告中双语字段名做归一化。
+    同时覆盖以下常见格式：
+      - 中文(English):     申请商(Applicant) :
+      - 中文English:       样品接收日期Sample Received Date：
+      - English中文:       Sample Received Date 样品接收日期：
+      - 中文 : English:    样品名称 : Sample name
+    去掉英文部分、尾部中英文冒号/空格，保留中文键名。
+    若键名纯为英文，则保留原值。
     """
     if not key:
         return ""
-    # 先做一次基础清洗
+    # 基础清洗
     key = normalize_text(key)
     # 去掉英文括号及其中的内容（支持嵌套一层括号）
     key = re.sub(r'\s*\([A-Za-z0-9\s&/\.\-_,#()]+\)\s*', '', key)
     # 去掉尾部中英文冒号
     key = key.rstrip('：:').strip()
-    return key
+    # 去掉末尾连续的非中文字段（英文 + 数字 + 常见标点和空格）
+    suffix_match = re.search(r'[A-Za-z0-9\s&/\.\-_,#]+$', key)
+    if suffix_match and len(suffix_match.group().strip()) >= 2:
+        candidate = key[:suffix_match.start()].strip()
+        if candidate:
+            key = candidate
+    # 去掉开头连续的非中文字段
+    prefix_match = re.match(r'^[A-Za-z0-9\s&/\.\-_,#]+', key)
+    if prefix_match and len(prefix_match.group().strip()) >= 2:
+        candidate = key[prefix_match.end():].strip()
+        if candidate:
+            key = candidate
+    return key.rstrip('：:').strip()
 
 
 # ==============================================
@@ -850,6 +880,96 @@ def extract_requirement_from_paragraphs_zh(doc):
     return ""
 
 
+def _is_requirement_text(text):
+    """判断文本是否像检测要求描述（而非标准编号或检测项目名）"""
+    if not text:
+        return False
+    t = text.lower()
+    keywords = ['根据客户要求', '依据', '根据', '参考', '按照',
+                '对所提交样品', '对所送样品', '进行以下项目',
+                '对所送样', '按客户要求', 'to determine',
+                'in accordance with', 'as specified by']
+    if any(k in t for k in keywords):
+        return True
+    # 长文本且包含标准方法号
+    if len(text) > 30 and re.search(r'(GB/T|GB|IEC|ISO|ASTM|EPA|US\s*EPA|QC/T|QJ/GAC|Q/ALKS)\s*\d', text):
+        return True
+    return False
+
+
+def _is_serial_column(table, col_idx, sample_rows=5):
+    """判断指定列是否主要为数字/中文序号列"""
+    serial_count = 0
+    total = 0
+    for row in table.rows[1:sample_rows + 1]:
+        cells = get_row_cells_text_fast(row)
+        if col_idx < len(cells):
+            val = cells[col_idx].strip()
+            if val:
+                total += 1
+                if re.match(r'^[\d一二三四五六七八九十]+[\.\、\．)\s]*$', val):
+                    serial_count += 1
+    return total > 0 and serial_count / total >= 0.5
+
+
+def _classify_requirement_table_columns(first_row):
+    """根据表头给每列打角色标签"""
+    roles = []
+    for cell in first_row:
+        cs = cell.strip()
+        if any(k in cs for k in ['检测要求', '测试要求', 'Test Requirement', 'Requirement']):
+            roles.append('req')
+        elif any(k in cs for k in ['结论', 'Conclusion']):
+            roles.append('con')
+        elif any(k in cs for k in ['结果', 'Result']):
+            roles.append('res')
+        else:
+            roles.append('other')
+    return roles
+
+
+def _determine_requirement_cols(table, first_row, col_roles):
+    """
+    在通用多列检测要求表中，确定真正的要求文本列。
+    会排除结论列、结果列和序号列，并在剩余列中选择要求语义最强的列。
+    """
+    candidate_cols = [i for i, r in enumerate(col_roles) if r in ('req', 'other')]
+
+    # 排除明显是序号列的
+    candidate_cols = [c for c in candidate_cols if not _is_serial_column(table, c)]
+
+    if not candidate_cols:
+        return []
+
+    best_col = None
+    best_score = -1
+    for col in candidate_cols:
+        req_text_count = 0
+        total_len = 0
+        std_only_count = 0
+        for row in table.rows[1:]:
+            cells = get_row_cells_text_fast(row)
+            if col >= len(cells):
+                continue
+            val = cells[col].strip()
+            if not val:
+                continue
+            total_len += len(val)
+            if _is_requirement_text(val):
+                req_text_count += 1
+            # 纯标准编号行（短且匹配标准号开头）
+            if re.search(r'^(GB/T|GB|IEC|ISO|ASTM|EPA|US\s*EPA|QC/T|QJ/GAC|Q/ALKS)\s*\d', val) and len(val) < 60:
+                std_only_count += 1
+
+        # 评分：要求文本命中加分，总长度加分，纯标准编号减分
+        score = req_text_count * 100 + total_len - std_only_count * 50
+        if score > best_score:
+            best_score = score
+            best_col = col
+
+    return [best_col] if best_col is not None else []
+
+
 def extract_requirement_zh(doc):
     """
     提取检测要求（基于专题方案2 v2.0）
@@ -935,34 +1055,37 @@ def extract_requirement_zh(doc):
                     all_lines.extend(lines)
                     continue
 
-        # D. 通用多列检测要求表处理
+        # D. 通用多列检测要求表处理（列角色识别 + 语义过滤）
         if has_req_keyword and len(table.rows) >= 2:
-            skip_cols = set()
-            for i, cell in enumerate(first_row_fast):
-                cell_s = cell.strip()
-                if '结论' in cell or 'Conclusion' in cell:
-                    skip_cols.add(i)
-                elif cell_s in ('结果', 'Result'):
-                    skip_cols.add(i)
-
-            extract_cols = [i for i, cell in enumerate(first_row_fast)
-                           if ('检测要求' in cell or '测试要求' in cell or 'Test Requirement' in cell)
-                           and i not in skip_cols]
+            col_roles = _classify_requirement_table_columns(first_row_fast)
+            extract_cols = _determine_requirement_cols(table, first_row_fast, col_roles)
 
             if extract_cols:
-                lines = []
+                # 优先提取明确要求语义的长文本
+                req_lines = []
                 for row in table.rows[1:]:
                     cells = get_row_cells_text_fast(row)
-                    row_parts = []
                     for col in extract_cols:
                         if col < len(cells):
                             val = cells[col].strip()
-                            if val:
-                                row_parts.append(val)
-                    if row_parts:
-                        lines.append(' '.join(row_parts))
-                if lines:
-                    all_lines.extend(lines)
+                            if val and _is_requirement_text(val):
+                                req_lines.append(val)
+
+                # 若未命中要求语义，兜底提取候选列全部非空文本
+                if not req_lines:
+                    for row in table.rows[1:]:
+                        cells = get_row_cells_text_fast(row)
+                        row_parts = []
+                        for col in extract_cols:
+                            if col < len(cells):
+                                val = cells[col].strip()
+                                if val:
+                                    row_parts.append(val)
+                        if row_parts:
+                            req_lines.append(' '.join(row_parts))
+
+                if req_lines:
+                    all_lines.extend(req_lines)
                     continue
 
     if all_lines:
@@ -1109,8 +1232,97 @@ def extract_conclusion_from_mixed_table_zh(doc):
     return ""
 
 
+def _is_result_table(table):
+    """
+    判断表格是否为检测结果表。
+    不仅看首行表头，还扫描前 10 行，支持跨行合并表头。
+    """
+    result_keywords = ['结果', 'Result', '结论', 'Conclusion', '限值', 'Limit']
+    for r_idx in range(min(10, len(table.rows))):
+        row_text = ' | '.join(get_row_cells_text_fast(table.rows[r_idx]))
+        if any(k in row_text for k in result_keywords):
+            return True
+    return False
+
+
+def _locate_conclusion_column(table, first_row, max_scan_rows=10):
+    """
+    在结果表中定位结论列。
+    1. 先在首行表头中找明确含“结论/Conclusion”的列；
+    2. 若未找到，扫描前 max_scan_rows 行，按每列出现结论关键词的频率定位；
+    3. 兜底：找“结果/Result”列。
+    返回: (列索引, 是否由内容定位)
+    """
+    # 策略1：表头明确含结论
+    for idx, cell in enumerate(first_row):
+        if any(k in cell for k in ['结论', 'Conclusion']):
+            return idx, False
+
+    # 策略2：扫描前N行，统计结论关键词出现频率
+    col_scores = [0] * len(first_row)
+    conclusion_keywords = ['结论', 'Conclusion', '符合', 'Pass', '合格', '不合格', 'Fail', '不符合', '未检出']
+    for r_idx in range(1, min(max_scan_rows + 1, len(table.rows))):
+        cells = get_row_cells_text_fast(table.rows[r_idx])
+        if len(cells) != len(first_row):
+            continue
+        for c_idx, val in enumerate(cells):
+            v = val.strip()
+            if any(k in v for k in conclusion_keywords):
+                # 短结论词权重更高
+                weight = 2 if len(v) <= 12 else 1
+                col_scores[c_idx] += weight
+
+    if max(col_scores) > 0:
+        return col_scores.index(max(col_scores)), True
+
+    # 策略3：兜底找“结果/Result”列
+    first_row_text = ' | '.join(first_row)
+    for idx, cell in enumerate(first_row):
+        if any(k in cell for k in ['结果', 'Result']) and \
+           not any(k in first_row_text for k in ['检测结果', 'Test Result', '要求', 'Requirement']):
+            return idx, False
+
+    return None, False
+
+
+def _read_conclusion_value(row, con_col, search_range=2):
+    """
+    读取一行中的结论值。
+    若定位列无效，则在右侧相邻列及行尾搜索结论关键词。
+    """
+    cells = get_row_cells_text_fast(row)
+    if not cells:
+        return ""
+
+    conclusion_keywords = ['符合', 'Pass', '合格', '不合格', 'Fail', '不符合', '未检出', 'N.D.', 'ND']
+
+    # 优先读取定位列
+    if 0 <= con_col < len(cells):
+        val = cells[con_col].strip()
+        if val and val not in ['/', '-', '—', '结论', 'Conclusion', '结果', 'Result']:
+            if any(k in val for k in conclusion_keywords) or len(val) <= 15:
+                return val
+
+    # 向右相邻列搜索
+    start_col = min(con_col + 1, len(cells) - 1)
+    for c in range(start_col, min(len(cells), start_col + search_range)):
+        val = cells[c].strip()
+        if val and val not in ['/', '-', '—']:
+            if any(k in val for k in conclusion_keywords):
+                return val
+
+    # 兜底：行尾最后两列
+    for c in range(max(0, len(cells) - 2), len(cells)):
+        val = cells[c].strip()
+        if val and val not in ['/', '-', '—', '结论', 'Conclusion', '结果', 'Result']:
+            if any(k in val for k in conclusion_keywords):
+                return val
+
+    return ""
+
+
 def extract_conclusion_from_result_tables_zh(doc):
-    """从检测结果表结论列/行综合判断；无结论列时兜底用结果列+逐值语义分析"""
+    """从检测结果表结论列/行综合判断；支持合并单元格、跨行表头导致的列偏移。"""
     all_items = []
 
     for table in doc.tables:
@@ -1122,9 +1334,8 @@ def extract_conclusion_from_result_tables_zh(doc):
         if len(first_row) == 1:
             continue
 
-        is_result = any(k in first_row_text for k in ['结果', 'Result', '结论',
-                                                       'Conclusion', '限值', 'Limit'])
-        if not is_result:
+        # 判断是否为结果表（支持跨行合并表头）
+        if not _is_result_table(table):
             continue
 
         # 跳过说明/备注/注释表：表头含 说明/备注/注释/Note/Remark/Annotation 且不含检测项目列
@@ -1134,15 +1345,12 @@ def extract_conclusion_from_result_tables_zh(doc):
             if not has_item_col:
                 continue
 
-        # --- 找结论列：优先 结论/Conclusion，兜底 结果/Result ---
-        con_col = None
-        for idx, cell in enumerate(first_row):
-            if any(k in cell for k in ['结论', 'Conclusion']):
-                con_col = idx
-                break
+        # 定位结论列
+        con_col, _ = _locate_conclusion_column(table, first_row)
 
         is_result_fallback = False
         if con_col is None:
+            # 兜底：找“结果/Result”列
             for idx, cell in enumerate(first_row):
                 if any(k in cell for k in ['结果', 'Result']) and \
                    not any(k in first_row_text for k in ['检测结果', 'Test Result',
@@ -1176,11 +1384,9 @@ def extract_conclusion_from_result_tables_zh(doc):
                                                   '测试项目', '结论', 'Conclusion']:
                     current_item = item_val
 
-            if con_col is not None and con_col < len(cells):
-                val = cells[con_col].strip()
-                if not val or val in ['/', '-', '—']:
-                    continue
-
+            # 读取结论值（支持列偏移兜底）
+            val = _read_conclusion_value(row, con_col)
+            if val:
                 item_for = current_item if current_item not in ['结论', 'Conclusion'] else ""
 
                 if is_result_fallback:
@@ -1343,8 +1549,8 @@ def extract_sample_count(doc):
                      'Part Description', 'Sample Description', 'Description']
 
     # 样品描述表特征关键词（含任一即优先识别为样品描述表）
-    sample_desc_markers = ['样品描述', '样品序号', '产品序号', '部件序号', '产品编号', '部件名称',
-                           'Sample Description', 'Part Description']
+    sample_desc_markers = ['样品描述', '样品组成', '样品序号', '产品序号', '部件序号', '产品编号', '部件名称',
+                           'Sample Description', 'Sample composition', 'Part Description']
     # 样品描述表互斥关键词：含任一结果表特征的表格不按样品描述表处理
     sample_desc_exclude = ['检测项目', '限值', 'mg/kg', 'Result', 'Limit',
                            'CAS No', 'CAS No.', 'Test item', '检测仪器', '方法检出限', 'XRF']

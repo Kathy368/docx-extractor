@@ -47,7 +47,7 @@ OUTPUT_FOLDER = r"D:\Kathy\PDF提取工具"
 
 # ====== 2. 【测试开关 - 非常重要】 ======
 # 测试模式1：只扫描前N个一级公司文件夹（0=全部扫描）
-TEST_FOLDER_LIMIT = 200
+TEST_FOLDER_LIMIT = 300
 
 # 测试模式2：只提取前N份报告（0=全部提取）
 TEST_REPORT_LIMIT = 0
